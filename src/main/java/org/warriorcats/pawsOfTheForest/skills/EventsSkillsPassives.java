@@ -1,0 +1,721 @@
+package org.warriorcats.pawsOfTheForest.skills;
+
+import com.comphenix.protocol.PacketType;
+import com.comphenix.protocol.ProtocolLibrary;
+import com.comphenix.protocol.ProtocolManager;
+import com.comphenix.protocol.events.ListenerPriority;
+import com.comphenix.protocol.events.PacketAdapter;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.reflect.StructureModifier;
+import com.destroystokyo.paper.event.player.PlayerJumpEvent;
+import net.minecraft.core.Holder;
+import net.minecraft.network.protocol.game.ClientboundSoundPacket;
+import org.bukkit.*;
+import org.bukkit.block.Biome;
+import org.bukkit.block.Block;
+import org.bukkit.damage.DamageType;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.LivingEntity;
+import org.bukkit.entity.Player;
+import org.bukkit.entity.Villager;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.block.Action;
+import org.bukkit.event.entity.*;
+import org.bukkit.event.player.*;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.util.Vector;
+import org.warriorcats.pawsOfTheForest.PawsOfTheForest;
+import org.warriorcats.pawsOfTheForest.core.configurations.MessagesConf;
+import org.warriorcats.pawsOfTheForest.core.events.*;
+import org.warriorcats.pawsOfTheForest.players.PlayerEntity;
+import org.warriorcats.pawsOfTheForest.preys.Prey;
+import org.warriorcats.pawsOfTheForest.utils.*;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Event handler for passive skills in the Warrior Cats skill system.
+ * 
+ * <p>This class manages all passive skills that automatically trigger based on player actions,
+ * environmental conditions, or combat situations. It includes movement-based skills, environmental
+ * adaptations, combat enhancements, and specialized abilities for different biomes and clans.</p>
+ * 
+ * <p>Key passive skill categories:</p>
+ * <ul>
+ *   <li><b>Movement Skills:</b> Silent Paw, Tracker footsteps, Speed bonuses</li>
+ *   <li><b>Combat Skills:</b> Efficient Kill, Ambusher, Blood Hunter, Stunning Blow</li>
+ *   <li><b>Environmental:</b> Forest Cover, Nightstalker, Thick Coat, Strong Swimmer</li>
+ *   <li><b>Survival Skills:</b> Hearty Appetite, Well Fed, Endurance Traveler</li>
+ *   <li><b>Utility Skills:</b> Flexible Morals, Scavenge, Rat Catcher, Aqua Balance</li>
+ * </ul>
+ * 
+ * @author PawsOfTheForest Development Team
+ * @version 1.0
+ * @since 1.0
+ */
+public class EventsSkillsPassives implements LoadingListener {
+
+    /** Percentage reduction in footstep volume per tier for Silent Paw skill */
+    public static final double SILENT_PAW_TIER_PERCENTAGE = 0.1;
+    /** Percentage bonus to XP and drops per tier for Efficient Kill skill */
+    public static final double EFFICIENT_KILL_TIER_PERCENTAGE = 0.1;
+    /** Percentage bonus damage per tier for Blood Hunter skill */
+    public static final double BLOOD_HUNTER_TIER_PERCENTAGE = 0.05;
+    /** Percentage reduction in hunger loss per tier for Endurance Traveler skill */
+    public static final double ENDURANCE_TRAVELER_TIER_PERCENTAGE = 0.05;
+    /** Additional jump velocity per tier for Climber's Grace skill */
+    public static final double CLIMBERS_GRACE_TIER_PERCENTAGE = 0.1;
+    /** Percentage damage reduction from cold per tier for Thick Coat skill */
+    public static final double THICK_COAT_TIER_PERCENTAGE = 0.1;
+    /** Percentage bonus saturation per tier for Hearty Appetite skill */
+    public static final double HEARTY_APPETITE_TIER_PERCENTAGE = 0.1;
+    /** Number of inventory slots per tier for Beast of Burden skill */
+    public static final int BEAST_OF_BURDEN_TIER_VALUE = 9;
+    /** Percentage bonus to health regeneration per tier for Well Fed skill */
+    public static final double WELL_FED_TIER_PERCENTAGE = 0.5;
+    /** Chance per tier to steal from NPCs for Flexible Morals skill */
+    public static final double FLEXIBLE_MORALS_TIER_PERCENTAGE = 0.1;
+    public static final double AMBUSHER_TIER_PERCENTAGE = 0.1;
+    public static final double URBAN_NAVIGATION_TIER_PERCENTAGE = 0.25;
+    public static final double RAT_CATCHER_TIER_RANGE = 25;
+    public static final double SPEED_OF_THE_MOOR_TIER_PERCENTAGE = 0.25;
+    public static final double LIGHTSTEP_TIER_PERCENTAGE = 0.5;
+    public static final double SHARP_WIND_TIER_PERCENTAGE = 0.1;
+    public static final int SHARP_WIND_TIER_DURATION_S = 10;
+    public static final double THICK_PELT_TIER_PERCENTAGE = 0.1;
+    public static final double STUNNING_BLOW_TIER_PERCENTAGE = 0.1;
+    public static final int STUNNING_BLOW_DURATION_S = 10;
+    public static final double AQUA_BALANCE_TIER_PERCENTAGE = 0.1;
+    public static final double WATERS_RESILIENCE_TIER_PERCENTAGE = 0.1;
+    public static final int TOXIC_CLAWS_DURATION_S = 2;
+    public static final double SILENT_KILL_TIER_PERCENTAGE = 0.1;
+
+    /** Thread-safe set of player UUIDs whose sound packets should be ignored for Silent Paw */
+    private final Set<UUID> soundPacketsIgnored = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    /** Thread-safe map storing footstep history for each player for Tracker skill */
+    private final Map<UUID, List<Footstep>> footsteps = new ConcurrentHashMap<>();
+    /** Thread-safe map storing default movement speeds for players */
+    private final Map<UUID, Float> defaultSpeeds = new ConcurrentHashMap<>();
+    /** Thread-safe map tracking entities affected by Sharp Wind bleeding with remaining duration */
+    private final Map<UUID, Double> entitiesBleeding = new ConcurrentHashMap<>();
+
+    /**
+     * Initializes passive skill systems that require setup on plugin load.
+     * 
+     * <p>Sets up:</p>
+     * <ul>
+     *   <li>Silent Paw packet listener for footstep sound modification</li>
+     *   <li>Tracker footstep tracking system with periodic cleanup</li>
+     *   <li>Sharp Wind bleeding effect management system</li>
+     * </ul>
+     */
+    @Override
+    public void load() {
+        // SILENT_PAW
+        ProtocolManager manager = ProtocolLibrary.getProtocolManager();
+        manager.addPacketListener(new PacketAdapter(
+                PawsOfTheForest.getInstance(),
+                ListenerPriority.NORMAL,
+                PacketType.fromClass(ClientboundSoundPacket.class)
+        ) {
+            @Override
+            public void onPacketSending(PacketEvent event) {
+                UUID receiver = event.getPlayer().getUniqueId();
+                if (soundPacketsIgnored.remove(receiver)) {
+                    return;
+                }
+
+                StructureModifier<Holder> holderMod =
+                        event.getPacket().getSpecificModifier(Holder.class);
+
+                Holder<?> rawHolder = holderMod.read(0);
+
+                String repr = rawHolder.toString();
+                int start = repr.indexOf("ResourceKey[");
+                int end   = repr.indexOf("]=", start);
+                if (start < 0 || end < 0) {
+                    return;
+                }
+                String soundName = repr.substring(start + "ResourceKey[".length(), end);
+
+                String lower = soundName.toLowerCase();
+                if (!lower.contains("step")) {
+                    return;
+                }
+
+                World world = event.getPlayer().getWorld();
+                int rawX = event.getPacket().getIntegers().read(0);
+                int rawY = event.getPacket().getIntegers().read(1);
+                int rawZ = event.getPacket().getIntegers().read(2);
+                double x = rawX / 8.0;
+                double y = rawY / 8.0;
+                double z = rawZ / 8.0;
+                Location stepLoc = new Location(world, x, y, z);
+                Player walker = null;
+                double minDist2 = 1.0;
+                for (Player p : world.getPlayers()) {
+                    double d2 = p.getLocation().distanceSquared(stepLoc);
+                    if (d2 <= minDist2) {
+                        walker = p;
+                        break;
+                    }
+                }
+
+                if (walker == null) {
+                    return;
+                }
+
+                event.setCancelled(true);
+
+                PlayerEntity pe = EventsCore.PLAYERS_CACHE.get(event.getPlayer().getUniqueId());
+                int tier = pe.getAbilityTier(Skills.SILENT_PAW);
+                double factor = (tier == 0)
+                        ? 1
+                        : Math.pow(1.0 - SILENT_PAW_TIER_PERCENTAGE, Math.min(tier, 3));
+                float reducedVol = (float) factor;
+
+                Location loc = walker.getLocation();
+                double baseRadius = 16.0;
+                for (Player listener : world.getPlayers()) {
+                    double effectiveRadius = baseRadius * reducedVol;
+                    if (listener.getLocation().distanceSquared(loc) <= effectiveRadius * effectiveRadius) {
+                        soundPacketsIgnored.add(listener.getUniqueId());
+                        listener.playSound(
+                                loc,
+                                loc.getBlock().getBlockData().getSoundGroup().getStepSound(),
+                                reducedVol,
+                                1.0f
+                        );
+                    }
+                }
+            }
+        });
+
+        // TRACKER
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                long now = System.currentTimeMillis();
+                footsteps.values().forEach(list -> list.removeIf(fs -> now - fs.timestamp() >= 5000));
+
+                for (Player tracker : Bukkit.getOnlinePlayers()) {
+                    PlayerEntity entity = EventsCore.PLAYERS_CACHE.get(tracker.getUniqueId());
+                    if (!entity.hasAbility(Skills.TRACKER)) {
+                        return;
+                    }
+                    for (Footstep fs : footsteps.values().stream().flatMap(List::stream).toList()) {
+                        if (fs.location().getWorld().equals(tracker.getWorld())
+                                && fs.location().distanceSquared(tracker.getLocation()) < 25) {
+                            tracker.playEffect(fs.location(), Effect.SHOOT_WHITE_SMOKE, 0);
+                        }
+                    }
+                }
+            }
+        }.runTaskTimer(PawsOfTheForest.getInstance(), 0, 10);
+
+        // SHARP_WIND bleeding
+        final int sharpWindScanDurationTicks = 10;
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                for (UUID uuid : entitiesBleeding.keySet()) {
+                    LivingEntity entity = (LivingEntity) Bukkit.getEntity(uuid);
+                    if (entity.isDead()) {
+                        entitiesBleeding.remove(uuid);
+                        return;
+                    }
+
+                    entity.damage(1);
+
+                    entity.getWorld().spawnParticle(Particle.DAMAGE_INDICATOR, entity.getLocation().add(0, 1, 0), 5, 0.3, 0.5, 0.3, 0.02);
+
+                    entity.getWorld().playSound(entity.getLocation(), Sound.ENTITY_GENERIC_HURT, 0.3f, 1.2f);
+
+                    entitiesBleeding.put(uuid, entitiesBleeding.get(uuid) - sharpWindScanDurationTicks);
+
+                    if (entitiesBleeding.get(uuid) <= 0) {
+                        entitiesBleeding.remove(uuid);
+                    }
+                }
+            }
+        }.runTaskTimer(PawsOfTheForest.getInstance(), 0L, sharpWindScanDurationTicks);
+    }
+
+    // EFFICIENT_KILL
+
+    /**
+     * Handles entity death events for Efficient Kill skill bonuses.
+     * Provides bonus XP and drops when killing prey from stealth.
+     * 
+     * <p>Requirements:</p>
+     * <ul>
+     *   <li>Entity must be prey</li>
+     *   <li>Kill must be from stealth</li>
+     *   <li>Player must have Efficient Kill skill</li>
+     * </ul>
+     *
+     * @param event the entity death event
+     */
+    @EventHandler
+    public void on(EntityDeathEvent event) {
+        Player killer = event.getEntity().getKiller();
+
+        if (killer == null) {
+            return;
+        }
+
+        Optional<Prey> prey = Prey.fromEntity(event.getEntity());
+
+        if (prey.isEmpty()) {
+            return;
+        }
+
+        if (!MobsUtils.isStealthFrom(killer, event.getEntity())) {
+            return;
+        }
+
+        PlayerEntity entity = EventsCore.PLAYERS_CACHE.get(killer.getUniqueId());
+
+        if (!entity.hasAbility(Skills.EFFICIENT_KILL)) {
+            event.setDroppedExp((int) prey.get().xp());
+            return;
+        }
+
+        int tier = entity.getAbilityTier(Skills.EFFICIENT_KILL);
+        double factor = tier * EFFICIENT_KILL_TIER_PERCENTAGE;
+        event.setDroppedExp((int) prey.get().xp() + (int) Math.round(prey.get().xp() * factor));
+        event.getDrops().add(MobsUtils.getRandomDropFood(1, (int) Math.round((event.getDrops().size() + tier) * factor)));
+    }
+
+    /**
+     * Handles food level changes for hunger-related passive skills.
+     * Applies reductions from Endurance Traveler and Waters Resilience skills.
+     *
+     * @param event the food level change event
+     */
+    @EventHandler
+    public void on(FoodLevelChangeEvent event) {
+        if (!(event.getEntity() instanceof Player player)) {
+            return;
+        }
+
+        int currentLevel = player.getFoodLevel();
+        int newLevel = event.getFoodLevel();
+
+        if (newLevel >= currentLevel) {
+            return;
+        }
+
+        PlayerEntity entity = EventsCore.PLAYERS_CACHE.get(player.getUniqueId());
+
+        // ENDURANCE_TRAVELER
+        if (!EventsCore.PLAYERS_FIGHTING.contains(player) && entity.hasAbility(Skills.ENDURANCE_TRAVELER)) {
+            int tier = entity.getAbilityTier(Skills.ENDURANCE_TRAVELER);
+            double factor = tier * ENDURANCE_TRAVELER_TIER_PERCENTAGE;
+            int diff = currentLevel - newLevel;
+            double reducedDiff = diff * (1.0 - factor);
+            event.setFoodLevel(currentLevel - (int) Math.ceil(reducedDiff));
+        }
+
+
+        // WATERS_RESILIENCE
+        if (entity.hasAbility(Skills.WATERS_RESILIENCE) && BiomesUtils.isWater(player.getLocation().getBlock().getBiome())) {
+            int tier = entity.getAbilityTier(Skills.WATERS_RESILIENCE);
+            double factor = tier * WATERS_RESILIENCE_TIER_PERCENTAGE;
+            int diff = currentLevel - newLevel;
+            double reducedDiff = diff * (1.0 - factor);
+            event.setFoodLevel(currentLevel - (int) Math.ceil(reducedDiff));
+        }
+    }
+
+    // CLIMBERS_GRACE
+
+    /**
+     * Handles player jump events for Climber's Grace skill.
+     * Provides additional jump velocity based on skill tier.
+     *
+     * @param event the player jump event
+     */
+    @EventHandler
+    public void on(PlayerJumpEvent event) {
+        Player player = event.getPlayer();
+        PlayerEntity entity = EventsCore.PLAYERS_CACHE.get(player.getUniqueId());
+        if (entity.hasAbility(Skills.CLIMBERS_GRACE)) {
+            int tier = entity.getAbilityTier(Skills.CLIMBERS_GRACE);
+            double factor = tier * CLIMBERS_GRACE_TIER_PERCENTAGE;
+            player.setVelocity(player.getVelocity().add(new Vector(0d, factor, 0d)));
+        }
+    }
+
+
+    /**
+     * Handles entity damage events for defensive passive skills.
+     * Applies effects from Thick Coat, Lightstep, and Thick Pelt skills.
+     *
+     * @param event the entity damage event
+     */
+    @EventHandler
+    public void on(EntityDamageEvent event) {
+        if (!(event.getEntity() instanceof Player player)) return;
+        PlayerEntity entity = EventsCore.PLAYERS_CACHE.get(player.getUniqueId());
+
+        // THICK COAT
+        if (entity.hasAbility(Skills.THICK_COAT)) {
+            Biome biome = player.getWorld().getBiome(player.getLocation());
+            if (BiomesUtils.isHot(biome) && BiomesUtils.isDamageFromFire(event.getDamageSource().getDamageType())) {
+                event.setDamage(event.getDamage() + 1);
+            }
+            if (BiomesUtils.isCold(biome) && BiomesUtils.isDamageFromFreeze(event.getDamageSource().getDamageType())) {
+                int tier = entity.getAbilityTier(Skills.THICK_COAT);
+                double factor = THICK_COAT_TIER_PERCENTAGE * tier;
+                event.setDamage(event.getDamage() * (1 - factor));
+            }
+        }
+
+        // LIGHTSTEP
+        if (event.getDamageSource().getDamageType() == DamageType.FALL && entity.hasAbility(Skills.LIGHTSTEP)) {
+            int tier = entity.getAbilityTier(Skills.LIGHTSTEP);
+            double factor = tier * LIGHTSTEP_TIER_PERCENTAGE;
+            event.setDamage(event.getDamage() * (1 - factor));
+        }
+
+        // THICK_PELT
+        if ((event.getDamageSource().getDamageType() == DamageType.PLAYER_ATTACK ||
+                event.getDamageSource().getDamageType() == DamageType.MOB_ATTACK) &&
+                entity.hasAbility(Skills.THICK_PELT)) {
+            int tier = entity.getAbilityTier(Skills.THICK_PELT);
+            double factor = tier * THICK_PELT_TIER_PERCENTAGE;
+            event.setDamage(event.getDamage() * (1 - factor));
+        }
+    }
+
+    @EventHandler
+    public void on(PlayerFreezeEvent event) {
+        PlayerEntity entity = EventsCore.PLAYERS_CACHE.get(event.getPlayer().getUniqueId());
+        if (entity.hasAbility(Skills.THICK_COAT)) {
+            event.getPlayer().setFreezeTicks(0);
+        }
+    }
+
+    // HEARTY_APPETITE
+
+    @EventHandler
+    public void on(PlayerItemConsumeEvent event) {
+        PlayerEntity entity = EventsCore.PLAYERS_CACHE.get(event.getPlayer().getUniqueId());
+        if (entity.hasAbility(Skills.HEARTY_APPETITE)) {
+            int tier = entity.getAbilityTier(Skills.HEARTY_APPETITE);
+            double factor = tier * HEARTY_APPETITE_TIER_PERCENTAGE;
+            float currentSaturation = event.getPlayer().getSaturation();
+            float bonus = (float) (event.getPlayer().getFoodLevel() * factor);
+            event.getPlayer().setSaturation(currentSaturation + bonus);
+        }
+    }
+
+    // WELL-FED
+
+    @EventHandler
+    public void on(EntityRegainHealthEvent event) {
+        if (!(event.getEntity() instanceof Player player)) return;
+
+        if (event.getRegainReason() != EntityRegainHealthEvent.RegainReason.SATIATED) return;
+
+        if (player.getFoodLevel() < 20) return;
+
+        PlayerEntity entity = EventsCore.PLAYERS_CACHE.get(player.getUniqueId());
+
+        if (entity.hasAbility(Skills.WELL_FED)) {
+            int tier = entity.getAbilityTier(Skills.WELL_FED);
+            double factor = WELL_FED_TIER_PERCENTAGE * tier;
+            event.setAmount(event.getAmount() * (1 + factor));
+        }
+    }
+
+    // SHELTERED_MIND
+
+    @EventHandler
+    public void on(PlayerFearEvent event) {
+        PlayerEntity entity = EventsCore.PLAYERS_CACHE.get(event.getPlayer().getUniqueId());
+        if (entity.hasAbility(Skills.SHELTERED_MIND)) {
+            EventsCore.FEAR_EFFECTS.forEach(event.getPlayer()::removePotionEffect);
+        }
+    }
+
+
+    @EventHandler
+    public void on(PlayerInteractEntityEvent event) {
+        Player player = event.getPlayer();
+        Entity entity = event.getRightClicked();
+
+        PlayerEntity playerEntity = EventsCore.PLAYERS_CACHE.get(event.getPlayer().getUniqueId());
+
+        // FLEXIBLE_MORALS
+        if (playerEntity.hasAbility(Skills.FLEXIBLE_MORALS)) {
+            int tier = playerEntity.getAbilityTier(Skills.FLEXIBLE_MORALS);
+            if (entity instanceof Villager villager) {
+                player.openMerchant(villager, true);
+                event.setCancelled(true);
+                if (Math.random() < FLEXIBLE_MORALS_TIER_PERCENTAGE * tier) {
+                    player.getInventory().addItem(MobsUtils.getRandomLootFromStealing());
+                    player.sendMessage(MessagesConf.Skills.COLOR_FEEDBACK + MessagesConf.Skills.PLAYER_MESSAGE_STOLE_FROM_NPC);
+                }
+            }
+        }
+
+        // RAT_CATCHER
+        if (playerEntity.hasAbility(Skills.RAT_CATCHER)) {
+            entity.remove();
+            player.getInventory().addItem(MobsUtils.getRandomLootFromRat());
+            player.sendMessage(MessagesConf.Skills.COLOR_FEEDBACK + MessagesConf.Skills.PLAYER_MESSAGE_CAUGHT_RAT);
+            event.setCancelled(true);
+        }
+    }
+
+
+    /**
+     * Handles entity damage by entity events for combat passive skills.
+     * Applies effects from Ambusher, Silent Kill, Toxic Claws, Sharp Wind, and Stunning Blow.
+     *
+     * @param event the entity damage by entity event
+     */
+    @EventHandler
+    public void on(EntityDamageByEntityEvent event) {
+        if (!(event.getDamager() instanceof Player player)) return;
+        if (!(event.getEntity() instanceof LivingEntity entity)) return;
+
+        PlayerEntity playerEntity = EventsCore.PLAYERS_CACHE.get(player.getUniqueId());
+
+        // AMBUSHER
+        if (MobsUtils.isStealthFrom(player, entity) && playerEntity.hasAbility(Skills.AMBUSHER)) {
+            int tier = playerEntity.getAbilityTier(Skills.AMBUSHER);
+            double factor = tier * AMBUSHER_TIER_PERCENTAGE;
+            event.setDamage(event.getDamage() * (1 + factor));
+        }
+
+        // SILENT_KILL
+        if (MobsUtils.isStealthFrom(player, entity) && playerEntity.hasAbility(Skills.SILENT_KILL)) {
+            int tier = playerEntity.getAbilityTier(Skills.SILENT_KILL);
+            double factor = tier * SILENT_KILL_TIER_PERCENTAGE;
+            event.setDamage(event.getDamage() * (1 + factor));
+        }
+
+        // TOXIC_CLAWS
+        if (BiomesUtils.isDark(player.getLocation()) && MobsUtils.canBePoisoned(entity) &&
+                playerEntity.hasAbility(Skills.TOXIC_CLAWS)) {
+            int tier = playerEntity.getAbilityTier(Skills.TOXIC_CLAWS);
+            entity.addPotionEffect(new PotionEffect(
+                    PotionEffectType.POISON,
+                    TOXIC_CLAWS_DURATION_S * 20,
+                    tier - 1,
+                    true,
+                    true,
+                    true
+            ));
+            entity.getWorld().playSound(entity.getLocation(), Sound.ENTITY_PLAYER_ATTACK_STRONG, 1f, 1.2f);
+            player.sendMessage(MessagesConf.Skills.COLOR_FEEDBACK + MessagesConf.Skills.PLAYER_MESSAGE_APPLIED_POISONED);
+            if (entity instanceof Player damaged) {
+                damaged.sendMessage(ChatColor.RED + MessagesConf.Skills.PLAYER_MESSAGE_POISONED);
+            }
+        }
+
+        // SHARP_WIND
+        if (BiomesUtils.isOpenSpace(player.getLocation()) && playerEntity.hasAbility(Skills.SHARP_WIND)) {
+            int tier = playerEntity.getAbilityTier(Skills.SHARP_WIND);
+            double factor = tier * SHARP_WIND_TIER_PERCENTAGE;
+            if (Math.random() < factor) {
+                entitiesBleeding.put(entity.getUniqueId(), (double) SHARP_WIND_TIER_DURATION_S * 20);
+                player.sendMessage(MessagesConf.Skills.COLOR_FEEDBACK + MessagesConf.Skills.PLAYER_MESSAGE_APPLIED_BLEEDING);
+                if (entity instanceof Player damaged) {
+                    damaged.sendMessage(ChatColor.RED + MessagesConf.Skills.PLAYER_MESSAGE_BLEEDING);
+                }
+            }
+        }
+
+        // STUNNING_BLOW
+        if (playerEntity.hasAbility(Skills.STUNNING_BLOW)) {
+            int tier = playerEntity.getAbilityTier(Skills.STUNNING_BLOW);
+            double factor = tier * STUNNING_BLOW_TIER_PERCENTAGE;
+
+            if (player.getLocation().getY() > entity.getLocation().getY() + 1) {
+                if (Math.random() < factor) {
+                    entity.addPotionEffect(new PotionEffect(
+                            PotionEffectType.SLOWNESS,
+                            STUNNING_BLOW_DURATION_S * 20,
+                            tier - 1,
+                            true,
+                            false,
+                            false
+                    ));
+                    entity.getWorld().playSound(entity.getLocation(), Sound.ENTITY_PLAYER_ATTACK_STRONG, 1f, 1.2f);
+                    player.sendMessage(MessagesConf.Skills.COLOR_FEEDBACK + MessagesConf.Skills.PLAYER_MESSAGE_APPLIED_STAGGERED);
+                    if (entity instanceof Player damaged) {
+                        damaged.sendMessage(ChatColor.RED + MessagesConf.Skills.PLAYER_MESSAGE_STAGGERED);
+                    }
+                }
+            }
+        }
+    }
+
+    // SCAVENGE
+
+    @EventHandler
+    public void on(PlayerInteractEvent event) {
+        Player player = event.getPlayer();
+
+        if (event.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        if (event.getClickedBlock() == null) return;
+
+        Block block = event.getClickedBlock();
+
+        PlayerEntity playerEntity = EventsCore.PLAYERS_CACHE.get(player.getUniqueId());
+
+        if (ItemsUtils.isTrashBlock(block.getType()) && playerEntity.hasAbility(Skills.SCAVENGE)) {
+            player.getInventory().addItem(ItemsUtils.getRandomLootFromTrash());
+            player.sendMessage(MessagesConf.Skills.COLOR_FEEDBACK + MessagesConf.Skills.PLAYER_MESSAGE_FOUND_TRASH_LOOT);
+            block.setType(Material.DIRT);
+            player.playSound(block.getLocation(), Sound.BLOCK_COMPOSTER_EMPTY, 1.0f, 1.0f);
+            event.setCancelled(true);
+        }
+    }
+
+    /**
+     * Handles player movement events for movement-based passive skills.
+     * Manages footstep tracking, environmental skills, and movement speed bonuses.
+     * 
+     * <p>Handles skills:</p>
+     * <ul>
+     *   <li>Nightstalker - Night vision in darkness</li>
+     *   <li>Forest Cover - Invisibility in forest biomes</li>
+     *   <li>Urban Navigation - Speed boost on urban blocks</li>
+     *   <li>Speed of the Moor - Speed boost in plain biomes</li>
+     *   <li>Strong Swimmer - Dolphin's grace in water</li>
+     *   <li>Rat Catcher - Visual tracking of nearby rats</li>
+     * </ul>
+     *
+     * @param event the player move event
+     */
+    @EventHandler
+    public void on(PlayerMoveEvent event) {
+        Player player = event.getPlayer();
+        footsteps.computeIfAbsent(player.getUniqueId(), k -> new ArrayList<>())
+                .add(new Footstep(player.getLocation(), System.currentTimeMillis()));
+
+        PlayerEntity playerEntity = EventsCore.PLAYERS_CACHE.get(player.getUniqueId());
+
+        // NIGHTSTALKER
+        if (playerEntity.hasAbility(Skills.NIGHTSTALKER)) {
+            int tier = playerEntity.getAbilityTier(Skills.NIGHTSTALKER);
+            if (BiomesUtils.isNight(player.getWorld())) {
+                player.addPotionEffect(new PotionEffect(
+                        PotionEffectType.NIGHT_VISION,
+                        Integer.MAX_VALUE,
+                        tier - 1,
+                        true,
+                        false,
+                        false
+                ));
+            } else {
+                player.removePotionEffect(PotionEffectType.NIGHT_VISION);
+            }
+        }
+
+        // FOREST_COVER
+        if (playerEntity.hasAbility(Skills.FOREST_COVER)) {
+            int tier = playerEntity.getAbilityTier(Skills.FOREST_COVER);
+            if (BiomesUtils.isForest(player.getLocation().getBlock().getBiome())) {
+                player.addPotionEffect(new PotionEffect(
+                        PotionEffectType.INVISIBILITY,
+                        Integer.MAX_VALUE,
+                        tier - 1,
+                        true,
+                        false,
+                        false
+                ));
+            } else {
+                player.removePotionEffect(PotionEffectType.INVISIBILITY);
+            }
+        }
+
+        // URBAN_NAVIGATION
+        if (playerEntity.hasAbility(Skills.URBAN_NAVIGATION)) {
+            Material blockBelow = player.getLocation().subtract(0, 1, 0).getBlock().getType();
+            defaultSpeeds.putIfAbsent(player.getUniqueId(), player.getWalkSpeed());
+            int tier = playerEntity.getAbilityTier(Skills.URBAN_NAVIGATION);
+            double factor = tier * URBAN_NAVIGATION_TIER_PERCENTAGE;
+            PlayersUtils.increaseMovementSpeed(player,
+                    () -> ItemsUtils.isUrbanBlock(blockBelow), factor, defaultSpeeds.get(player.getUniqueId()));
+        }
+
+        // SPEED OF THE MOOR
+        if (playerEntity.hasAbility(Skills.SPEED_OF_THE_MOOR)) {
+            defaultSpeeds.putIfAbsent(player.getUniqueId(), player.getWalkSpeed());
+            int tier = playerEntity.getAbilityTier(Skills.SPEED_OF_THE_MOOR);
+            double factor = tier * SPEED_OF_THE_MOOR_TIER_PERCENTAGE;
+            PlayersUtils.increaseMovementSpeed(player,
+                    () -> BiomesUtils.isPlain(player.getLocation().getBlock().getBiome()),
+                    factor,
+                    defaultSpeeds.get(player.getUniqueId()));
+        }
+
+        // STRONG_SWIMMER
+        if (playerEntity.hasAbility(Skills.STRONG_SWIMMER)) {
+            int tier = playerEntity.getAbilityTier(Skills.STRONG_SWIMMER);
+            if (player.isInWater() || player.isSwimming()) {
+                player.addPotionEffect(new PotionEffect(
+                        PotionEffectType.DOLPHINS_GRACE,
+                        Integer.MAX_VALUE,
+                        tier - 1,
+                        true,
+                        false,
+                        false
+                ));
+            } else {
+                player.removePotionEffect(PotionEffectType.DOLPHINS_GRACE);
+            }
+        }
+
+        // RAT_CATCHER tracking
+        if (playerEntity.hasAbility(Skills.RAT_CATCHER)) {
+            int tier = playerEntity.getAbilityTier(Skills.RAT_CATCHER);
+            double radius = tier * RAT_CATCHER_TIER_RANGE;
+            player.getWorld().getNearbyLivingEntities(player.getLocation(), radius, radius, radius)
+                    .stream()
+                    .filter(entity -> {
+                        Optional<Prey> prey = Prey.fromEntity(entity);
+                        return prey.filter(MobsUtils::isRat).isPresent();
+                    })
+                    .forEach(rat -> {
+                        player.spawnParticle(
+                                Particle.WITCH,
+                                rat.getLocation().add(0, 0.3, 0),
+                                10,
+                                0.2, 0.5, 0.2,
+                                0
+                        );
+                    });
+        }
+    }
+
+    // AQUA_BALANCE
+    @EventHandler
+    public void on(PlayerFishEvent event) {
+        Player player = event.getPlayer();
+
+        PlayerEntity playerEntity = EventsCore.PLAYERS_CACHE.get(player.getUniqueId());
+
+        event.setCancelled(true);
+        if (event.getCaught() != null) {
+            event.getCaught().remove();
+        }
+        if (playerEntity.hasAbility(Skills.AQUA_BALANCE)) {
+            int tier = playerEntity.getAbilityTier(Skills.AQUA_BALANCE);
+            if (Math.random() < tier * AQUA_BALANCE_TIER_PERCENTAGE) {
+                player.getInventory().addItem(ItemsUtils.getRandomLootFromFish());
+                player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 0.8f, 1.4f);
+                player.sendMessage(MessagesConf.Skills.COLOR_FEEDBACK + MessagesConf.Skills.PLAYER_MESSAGE_APPLIED_AQUA_BALANCE);
+            }
+        }
+    }
+}
